@@ -1,0 +1,13 @@
+name: "DeepSeek"
+command: "deepseek-model-provider/bin/obot-provider"
+validateArgs:
+  - validate
+icon: "/admin/assets/deepseek-logo.svg"
+iconDark: "/admin/assets/deepseek-logo.svg"
+description: "Model Provider for DeepSeek"
+link: "https://www.deepseek.com/"
+requiredConfigurationParameters:
+  - name: "OBOT_DEEPSEEK_MODEL_PROVIDER_API_KEY"
+    friendlyName: "API Key"
+    description: "DeepSeek API Key. Can be created and fetched from https://platform.deepseek.com/api_keys"
+    sensitive: true

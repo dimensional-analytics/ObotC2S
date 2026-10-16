@@ -1,0 +1,243 @@
+--- a/pkg/gateway/types/users.go
++++ b/pkg/gateway/types/users.go
+@@ -20,6 +20,8 @@
+ 	Username       string      `json:"username"`
+ 	HashedUsername string      `json:"-" gorm:"unique"`
+ 	Email          string      `json:"email"`
++	// Presentation metadata only; not used for authentication or account matching.
++	EmailDisplayDomain string `json:"-"`
+ 	HashedEmail    string      `json:"-"`
+ 	VerifiedEmail  *bool       `json:"verifiedEmail,omitempty"`
+ 	Role           types2.Role `json:"role"`
+@@ -65,6 +67,7 @@
+ 		DisplayName:            u.DisplayName,
+ 		Username:               u.Username,
+ 		Email:                  u.Email,
++		EmailDisplayDomain:     u.EmailDisplayDomain,
+ 		Role:                   u.Role,
+ 		EffectiveRole:          effectiveRole,
+ 		Groups:                 groups,
+--- a/apiclient/types/user.go
++++ b/apiclient/types/user.go
+@@ -72,6 +72,7 @@
+ 	AuthProviderGroups     []string `json:"authProviderGroups,omitempty"`
+ 	ExplicitRole           bool     `json:"explicitRole,omitempty"`
+ 	Email                  string   `json:"email,omitempty"`
++	EmailDisplayDomain     string   `json:"emailDisplayDomain,omitempty"`
+ 	IconURL                string   `json:"iconURL,omitempty"`
+ 	Timezone               string   `json:"timezone,omitempty"`
+ 	CurrentAuthProvider    string   `json:"currentAuthProvider,omitempty"`
+--- a/pkg/gateway/client/user.go
++++ b/pkg/gateway/client/user.go
+@@ -406,8 +406,14 @@
+ 		return fmt.Errorf("failed to decrypt identity: %w", err)
+ 	}
+ 
+-	if user.IconURL == identity.IconURL && time.Since(identity.IconLastChecked) < 7*24*time.Hour && user.DisplayName != "" {
+-		// Icon was checked less than 7 days ago, and the user is still using the same auth provider and DisplayName is already set
++	profileTTL := 7 * 24 * time.Hour
++	if authProviderName == "pingfederate-auth-provider" {
++		// Pick up edits to the claim mapping and display domain promptly.
++		profileTTL = 5 * time.Minute
++	}
++	if user.IconURL == identity.IconURL && time.Since(identity.IconLastChecked) < profileTTL && user.DisplayName != "" {
++		// The profile is within its refresh window, the provider is unchanged,
++		// and the display name is already set.
+ 		return nil
+ 	}
+ 
+@@ -417,6 +423,8 @@
+ 	}
+ 
+ 	switch authProviderName {
++	case "pingfederate-auth-provider":
++		applyPingFederateProfile(user, &identity, profile)
+ 	case "github-auth-provider":
+ 		if iconURL, ok := profile["avatar_url"].(string); ok {
+ 			user.IconURL = iconURL
+@@ -500,6 +508,13 @@
+ 			return err
+ 		}
+ 
++		if authProviderName == "pingfederate-auth-provider" {
++			// GORM struct updates skip empty strings. Explicitly persist clearing
++			// this setting when the administrator removes the display domain.
++			if err := tx.Model(&types.User{}).Where("id = ?", user.ID).Update("email_display_domain", user.EmailDisplayDomain).Error; err != nil {
++				return err
++			}
++		}
+ 		// Omit the group check column to prevent resetting the group refresh window
+ 		return tx.Omit(groupsLastCheckedColumn).Updates(&identity).Error
+ 	})
+--- /dev/null
++++ b/pkg/gateway/client/pingfederate_profile.go
+@@ -0,0 +1,14 @@
++package client
++
++import "github.com/obot-platform/obot/pkg/gateway/types"
++
++func applyPingFederateProfile(user *types.User, identity *types.Identity, profile map[string]any) {
++	if name, ok := profile["name"].(string); ok && name != "" {
++		user.DisplayName = name
++	}
++	if picture, ok := profile["picture"].(string); ok {
++		user.IconURL = picture
++		identity.IconURL = picture
++	}
++	user.EmailDisplayDomain, _ = profile["email_display_domain"].(string)
++}
+--- /dev/null
++++ b/pkg/gateway/client/pingfederate_profile_test.go
+@@ -0,0 +1,27 @@
++package client
++
++import (
++	"testing"
++
++	"github.com/obot-platform/obot/pkg/gateway/types"
++)
++
++func TestPingFederateProfilePreservesIdentity(t *testing.T) {
++	u := &types.User{Username: "JDOE", Email: "JDOE", HashedEmail: "hash-email", HashedUsername: "hash-user"}
++	id := &types.Identity{ProviderUserID: "stable-subject"}
++	applyPingFederateProfile(u, id, map[string]any{"name": "Jane Doe", "email": "someone-else", "email_display_domain": "example.com"})
++	if u.Username != "JDOE" || u.Email != "JDOE" || u.HashedEmail != "hash-email" || u.HashedUsername != "hash-user" || id.ProviderUserID != "stable-subject" {
++		t.Fatal("profile changed identity")
++	}
++	if u.DisplayName != "Jane Doe" || u.EmailDisplayDomain != "example.com" {
++		t.Fatalf("profile = %+v", u)
++	}
++	apiUser := types.ConvertUser(u, false, "pingfederate-auth-provider")
++	if apiUser.Email != "JDOE" || apiUser.EmailDisplayDomain != "example.com" {
++		t.Fatalf("API profile = %+v", apiUser)
++	}
++	applyPingFederateProfile(u, id, map[string]any{"name": "Jane Doe", "email_display_domain": ""})
++	if u.EmailDisplayDomain != "" {
++		t.Fatal("display domain did not clear")
++	}
++}
+--- a/ui/user/src/lib/services/user/types.ts
++++ b/ui/user/src/lib/services/user/types.ts
+@@ -921,6 +921,7 @@
+ 	created: string;
+ 	username: string;
+ 	email: string;
++	emailDisplayDomain?: string;
+ 	explicitRole: boolean;
+ 	role: number;
+ 	effectiveRole: number;
+@@ -964,6 +965,7 @@
+ export interface Profile {
+ 	id: string;
+ 	email: string;
++	emailDisplayDomain?: string;
+ 	iconURL: string;
+ 	role: number;
+ 	effectiveRole: number;
+--- /dev/null
++++ b/ui/user/src/lib/emailDisplay.ts
+@@ -0,0 +1,8 @@
++// Only use for rendering. Authentication, edits and API requests keep user.email.
++export function formatUserEmail(user: { email?: string; emailDisplayDomain?: string }): string {
++	const rawEmail = user.email ?? '';
++	const domain = (user.emailDisplayDomain ?? '').trim().replace(/^@/, '').toLowerCase();
++	if (!domain) return rawEmail;
++	const email = rawEmail.toLowerCase();
++	return email && !email.includes('@') ? `${email}@${domain}` : email;
++}
+--- /dev/null
++++ b/ui/user/src/lib/components/profile/DisplayEmail.svelte
+@@ -0,0 +1,7 @@
++<script lang="ts">
++	import { formatUserEmail } from '$lib/emailDisplay';
++
++	let { user }: { user: { email?: string; emailDisplayDomain?: string } } = $props();
++</script>
++
++<span>{formatUserEmail(user)}</span>
+--- /dev/null
++++ b/ui/user/src/lib/components/profile/DisplayEmail.svelte.spec.ts
+@@ -0,0 +1,32 @@
++import DisplayEmail from './DisplayEmail.svelte';
++import { describe, expect, it } from 'vitest';
++import { render } from 'vitest-browser-svelte';
++import { page } from 'vitest/browser';
++
++describe('email presentation', () => {
++	it('lowercases a username and appends the configured domain without mutating it', async () => {
++		const user = { email: 'JDOE', emailDisplayDomain: 'Example.COM' };
++		await render(DisplayEmail, { user });
++		await expect.element(page.getByText('jdoe@example.com', { exact: true })).toBeVisible();
++		expect(user.email).toBe('JDOE');
++	});
++
++	it('does not append a second domain to a full email address', async () => {
++		await render(DisplayEmail, { user: { email: 'JDOE@Other.COM', emailDisplayDomain: 'example.com' } });
++		await expect.element(page.getByText('jdoe@other.com', { exact: true })).toBeVisible();
++	});
++
++	it('preserves existing email display when no domain is configured', async () => {
++		await render(DisplayEmail, { user: { email: 'JDOE' } });
++		await expect.element(page.getByText('JDOE', { exact: true })).toBeVisible();
++	});
++
++	it('accepts a domain with an initial @ and updates when it is cleared', async () => {
++		const screen = await render(DisplayEmail, {
++			user: { email: 'JDOE', emailDisplayDomain: '@Example.COM' }
++		});
++		await expect.element(page.getByText('jdoe@example.com', { exact: true })).toBeVisible();
++		await screen.rerender({ user: { email: 'JDOE', emailDisplayDomain: '' } });
++		await expect.element(page.getByText('JDOE', { exact: true })).toBeVisible();
++	});
++});
+--- a/ui/user/src/lib/components/profile/MyAccount.svelte
++++ b/ui/user/src/lib/components/profile/MyAccount.svelte
+@@ -9,6 +9,7 @@
+ 	import { goto } from '$lib/url';
+ 	import { getUserRoleLabel } from '$lib/utils';
+ 	import ResponsiveDialog from '../ResponsiveDialog.svelte';
++	import DisplayEmail from './DisplayEmail.svelte';
+ 	import { User } from '@lucide/svelte';
+ 
+ 	interface Props {
+@@ -85,7 +86,7 @@
+ 	<hr />
+ 	<div class="flex flex-row py-3">
+ 		<div class="w-1/2 max-w-[150px]">Email:</div>
+-		<div class="w-1/2 wrap-break-word">{profile.current.email}</div>
++		<div class="w-1/2 wrap-break-word"><DisplayEmail user={profile.current} /></div>
+ 	</div>
+ 	<hr />
+ 	<div class="flex flex-row py-3">
+--- a/ui/user/src/routes/identity-access/UsersView.svelte
++++ b/ui/user/src/routes/identity-access/UsersView.svelte
+@@ -6,9 +6,11 @@
+ 	import ResponsiveDialog from '$lib/components/ResponsiveDialog.svelte';
+ 	import Search from '$lib/components/Search.svelte';
+ 	import UserLimitNotice from '$lib/components/admin/license/UserLimitNotice.svelte';
++	import DisplayEmail from '$lib/components/profile/DisplayEmail.svelte';
+ 	import Table from '$lib/components/table/Table.svelte';
+ 	import { PAGE_TRANSITION_DURATION } from '$lib/constants';
+ 	import { COMMUNITY_ENTITLEMENT } from '$lib/constants';
++	import { formatUserEmail } from '$lib/emailDisplay';
+ 	import Loading from '$lib/icons/Loading.svelte';
+ 	import { AdminService, UserService, Group, Role, type OrgUser } from '$lib/services';
+ 	import { userRoleOptions } from '$lib/services/admin/constants';
+@@ -55,7 +57,7 @@
+ 			.filter(
+ 				(user) =>
+ 					user.name.toLowerCase().includes(query.toLowerCase()) ||
+-					user.email.toLowerCase().includes(query.toLowerCase())
++					formatUserEmail(user).toLowerCase().includes(query.toLowerCase())
+ 			)
+ 	);
+ 
+@@ -245,6 +247,8 @@
+ 								</div>
+ 							{/if}
+ 						</div>
++					{:else if property === 'email'}
++						<DisplayEmail user={d} />
+ 					{:else if property === 'effectiveRole'}
+ 						<div class="flex items-center gap-1">
+ 							{d.effectiveRole}
